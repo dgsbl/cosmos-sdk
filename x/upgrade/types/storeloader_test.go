@@ -46,6 +46,23 @@ func initStore(t *testing.T, db dbm.DB, storeKey string, k, v []byte) {
 	require.Equal(t, int64(1), commitID.Version)
 }
 
+func newStore(t *testing.T, db dbm.DB, storeKey string, k, v []byte) {
+	rs := rootmulti.NewStore(db)
+	rs.SetPruning(store.PruneNothing)
+	key := sdk.NewKVStoreKey(storeKey)
+	rs.MountStoreWithDB(key, store.StoreTypeIAVL, nil)
+	err := rs.LoadLatestVersion()
+	require.Nil(t, err)
+	//require.Equal(t, int64(0), rs.LastCommitID().Version)
+
+	// write some data in substore
+	kv, _ := rs.GetStore(key).(store.KVStore)
+	require.NotNil(t, kv)
+	kv.Set(k, v)
+	//_ = rs.Commit()
+	//require.Equal(t, int64(1), commitID.Version)
+}
+
 func checkStore(t *testing.T, db dbm.DB, ver int64, storeKey string, k, v []byte) {
 	rs := rootmulti.NewStore(db)
 	rs.SetPruning(store.PruneNothing)
@@ -89,20 +106,33 @@ func TestSetLoader(t *testing.T) {
 		origStoreKey string
 		loadStoreKey string
 	}{
-		"don't set loader": {
-			origStoreKey: "foo",
-			loadStoreKey: "foo",
-		},
-		"rename with inline opts": {
+		//"don't set loader": {
+		//	origStoreKey: "foo",
+		//	loadStoreKey: "foo",
+		//},
+		//"rename with inline opts": {
+		//	setLoader: useUpgradeLoader(upgradeHeight, &store.StoreUpgrades{
+		//		Renamed: []store.StoreRename{{
+		//			OldKey: "foo",
+		//			NewKey: "bar",
+		//		}},
+		//	}),
+		//	origStoreKey: "foo",
+		//	loadStoreKey: "bar",
+		//},
+		"added":{
 			setLoader: useUpgradeLoader(upgradeHeight, &store.StoreUpgrades{
-				Renamed: []store.StoreRename{{
-					OldKey: "foo",
-					NewKey: "bar",
-				}},
+				Added: []string{"bar"},
 			}),
 			origStoreKey: "foo",
 			loadStoreKey: "bar",
 		},
+		//"deleted":{
+		//	setLoader: useUpgradeLoader(upgradeHeight, &store.StoreUpgrades{
+		//		Deleted: []string{"bar"},
+		//	}),
+		//	origStoreKey: "bar",
+		//},
 	}
 
 	k := []byte("key")
@@ -110,47 +140,134 @@ func TestSetLoader(t *testing.T) {
 
 	for name, tc := range cases {
 		tc := tc
-		t.Run(name, func(t *testing.T) {
-			// prepare a db with some data
-			db := dbm.NewMemDB()
+		if name =="added"{
+			t.Run(name, func(t *testing.T) {
+				// prepare a db with some data
+				db := dbm.NewMemDB()
 
-			initStore(t, db, tc.origStoreKey, k, v)
+				initStore(t, db, tc.origStoreKey, k, v)
 
-			// load the app with the existing db
-			opts := []func(*baseapp.BaseApp){baseapp.SetPruning(store.PruneNothing)}
+				// load the app with the existing db
+				opts := []func(*baseapp.BaseApp){baseapp.SetPruning(store.PruneNothing)}
 
-			origapp := baseapp.NewBaseApp(t.Name(), defaultLogger(), db, nil, opts...)
-			origapp.MountStores(sdk.NewKVStoreKey(tc.origStoreKey))
-			err := origapp.LoadLatestVersion()
-			require.Nil(t, err)
+				origapp := baseapp.NewBaseApp(t.Name(), defaultLogger(), db, nil, opts...)
+				origapp.MountStores(sdk.NewKVStoreKey(tc.origStoreKey))
+				err := origapp.LoadLatestVersion()
+				require.Nil(t, err)
 
-			for i := int64(2); i <= upgradeHeight-1; i++ {
-				origapp.BeginBlock(abci.RequestBeginBlock{Header: tmproto.Header{Height: i}})
-				res := origapp.Commit()
+				for i := int64(2); i <= upgradeHeight-1; i++ {
+					origapp.BeginBlock(abci.RequestBeginBlock{Header: tmproto.Header{Height: i}})
+					res := origapp.Commit()
+					require.NotNil(t, res.Data)
+				}
+
+				checkStore(t, db, 4, tc.origStoreKey, k, v)
+
+				if tc.setLoader != nil {
+					opts = append(opts, tc.setLoader)
+				}
+
+				newStore(t, db, tc.loadStoreKey, k, v)
+
+				// load the new app with the original app db
+				app := baseapp.NewBaseApp(t.Name(), defaultLogger(), db, nil, opts...)
+				app.MountStores(sdk.NewKVStoreKey(tc.origStoreKey))
+				app.MountStores(sdk.NewKVStoreKey(tc.loadStoreKey))
+				err = app.LoadLatestVersion()
+				require.Nil(t, err)
+				// "execute" one block
+				app.BeginBlock(abci.RequestBeginBlock{Header: tmproto.Header{Height: upgradeHeight}})
+				res := app.Commit()
 				require.NotNil(t, res.Data)
-			}
 
-			if tc.setLoader != nil {
-				opts = append(opts, tc.setLoader)
-			}
+				checkStore(t, db, upgradeHeight, tc.loadStoreKey, k, v)
+				checkStore(t, db, upgradeHeight, tc.origStoreKey, k, v)
+			})
+		}else if name == "deleted"{
+			t.Run(name, func(t *testing.T) {
+				// prepare a db with some data
+				db := dbm.NewMemDB()
 
-			// load the new app with the original app db
-			app := baseapp.NewBaseApp(t.Name(), defaultLogger(), db, nil, opts...)
-			app.MountStores(sdk.NewKVStoreKey(tc.loadStoreKey))
-			err = app.LoadLatestVersion()
-			require.Nil(t, err)
+				initStore(t, db, tc.origStoreKey, k, v)
 
-			// "execute" one block
-			app.BeginBlock(abci.RequestBeginBlock{Header: tmproto.Header{Height: upgradeHeight}})
-			res := app.Commit()
-			require.NotNil(t, res.Data)
+				rs := rootmulti.NewStore(db)
+				rs.SetPruning(store.PruneNothing)
+				key := sdk.NewKVStoreKey(tc.origStoreKey)
+				storeResp := rs.GetCommitKVStore(key)
+				require.Nil(t, storeResp)
+				opts := []func(*baseapp.BaseApp){baseapp.SetPruning(store.PruneNothing)}
+				origapp := baseapp.NewBaseApp(t.Name(), defaultLogger(), db, nil, opts...)
+				origapp.MountStores(sdk.NewKVStoreKey(tc.origStoreKey))
+				err = origapp.LoadLatestVersion()
+				require.Nil(t, err)
 
-			// check db is properly updated
-			if tc.setLoader != nil {
+				for i := int64(1); i <= upgradeHeight-1; i++ {
+					origapp.BeginBlock(abci.RequestBeginBlock{Header: tmproto.Header{Height: i}})
+					res := origapp.Commit()
+					require.NotNil(t, res.Data)
+				}
+
+				checkStore(t, db, 4, tc.origStoreKey, k, v)
+
+				if tc.setLoader != nil {
+					opts = append(opts, tc.setLoader)
+				}
+
+				// load the new app with the original app db
+				app := baseapp.NewBaseApp(t.Name(), defaultLogger(), db, nil, opts...)
+				app.MountStores(sdk.NewKVStoreKey(tc.origStoreKey))
+				err = app.LoadLatestVersion()
+				require.Nil(t, err)
+				// "execute" one block
+				app.BeginBlock(abci.RequestBeginBlock{Header: tmproto.Header{Height: upgradeHeight}})
+				res := app.Commit()
+				require.NotNil(t, res.Data)
+
 				checkStore(t, db, upgradeHeight, tc.origStoreKey, k, nil)
+			})
+		}else{
+			t.Run(name, func(t *testing.T) {
+				// prepare a db with some data
+				db := dbm.NewMemDB()
 
-			}
-			checkStore(t, db, upgradeHeight, tc.loadStoreKey, k, v)
-		})
+				initStore(t, db, tc.origStoreKey, k, v)
+
+				// load the app with the existing db
+				opts := []func(*baseapp.BaseApp){baseapp.SetPruning(store.PruneNothing)}
+
+				origapp := baseapp.NewBaseApp(t.Name(), defaultLogger(), db, nil, opts...)
+				origapp.MountStores(sdk.NewKVStoreKey(tc.origStoreKey))
+				err := origapp.LoadLatestVersion()
+				require.Nil(t, err)
+
+				for i := int64(2); i <= upgradeHeight-1; i++ {
+					origapp.BeginBlock(abci.RequestBeginBlock{Header: tmproto.Header{Height: i}})
+					res := origapp.Commit()
+					require.NotNil(t, res.Data)
+				}
+
+				if tc.setLoader != nil {
+					opts = append(opts, tc.setLoader)
+				}
+
+				// load the new app with the original app db
+				app := baseapp.NewBaseApp(t.Name(), defaultLogger(), db, nil, opts...)
+				app.MountStores(sdk.NewKVStoreKey(tc.loadStoreKey))
+				err = app.LoadLatestVersion()
+				require.Nil(t, err)
+
+				// "execute" one block
+				app.BeginBlock(abci.RequestBeginBlock{Header: tmproto.Header{Height: upgradeHeight}})
+				res := app.Commit()
+				require.NotNil(t, res.Data)
+
+				// check db is properly updated
+				if tc.setLoader != nil {
+					checkStore(t, db, upgradeHeight, tc.origStoreKey, k, nil)
+
+				}
+				checkStore(t, db, upgradeHeight, tc.loadStoreKey, k, v)
+			})
+		}
 	}
 }
